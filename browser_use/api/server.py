@@ -1,17 +1,10 @@
-"""FastAPI Server for browser-use - exposes browser automation capabilities via REST API.
+"""Standalone FastAPI Server for browser-use - completely isolated version.
 
-This server provides endpoints for:
-- Running autonomous browser tasks with an AI agent
-- Direct browser control (navigation, clicking, typing, etc.)
-- Content extraction from web pages
-- File system operations
+This server provides browser automation capabilities via REST API endpoints
+without importing the main browser_use package to avoid dependency issues.
 
 Usage:
-    uvicorn browser_use.api.server:app --host 0.0.0.0 --port 8000
-
-Or programmatically:
-    from browser_use.api.server import create_app
-    app = create_app()
+    uvicorn browser_use.api.standalone_server:app --host 0.0.0.0 --port 8000
 """
 
 import asyncio
@@ -24,48 +17,116 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing_extensions import Annotated
 import uvicorn
 
 # Add browser-use to path if running from source
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-# Import and configure logging
-from browser_use.logging_config import setup_logging
-
-# Set up logging for API server
-os.environ['BROWSER_USE_LOGGING_LEVEL'] = 'info'
-setup_logging(stream=sys.stderr, log_level='info')
-
-# Import browser_use modules
-from browser_use import ActionModel, Agent
-from browser_use.browser import BrowserProfile, BrowserSession
-from browser_use.config import get_default_llm, get_default_profile, load_browser_use_config
-from browser_use.controller.service import Controller
-from browser_use.filesystem.file_system import FileSystem
-from browser_use.llm.openai.chat import ChatOpenAI
-from browser_use.telemetry import CLITelemetryEvent, ProductTelemetry
-from browser_use.telemetry.views import BaseTelemetryEvent
-from browser_use.utils import get_browser_use_version
-from dataclasses import dataclass
-
-@dataclass
-class APIServerTelemetryEvent(BaseTelemetryEvent):
-    """Telemetry event for API server usage"""
-    
-    version: str
-    action: str  # 'start', 'stop', 'tool_call'
-    tool_name: str | None = None
-    duration_seconds: float | None = None
-    error_message: str | None = None
-    
-    name: str = 'api_server_event'
-
+# Set up basic logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Import specific browser_use modules to avoid config system
+try:
+    from browser_use.browser import BrowserProfile, BrowserSession
+    from browser_use.controller.service import Controller
+    from browser_use.filesystem.file_system import FileSystem
+    from browser_use.llm.openai.chat import ChatOpenAI
+    from browser_use.agent.service import Agent
+    from browser_use import ActionModel
+except ImportError as e:
+    logger.error(f"Failed to import browser_use modules: {e}")
+    logger.error("Make sure you have browser-use installed with: pip install browser-use")
+    sys.exit(1)
+
+# Pydantic models for API requests and responses
+class BrowserNavigateRequest(BaseModel):
+    url: str = Field(..., description="The URL to navigate to")
+    new_tab: bool = Field(False, description="Whether to open in a new tab")
+    session_id: str = Field("default", description="Browser session ID")
+
+class BrowserClickRequest(BaseModel):
+    index: int = Field(..., description="The index of the element to click")
+    new_tab: bool = Field(False, description="Whether to open in a new tab")
+    session_id: str = Field("default", description="Browser session ID")
+
+class BrowserTypeRequest(BaseModel):
+    index: int = Field(..., description="The index of the input element")
+    text: str = Field(..., description="The text to type")
+    session_id: str = Field("default", description="Browser session ID")
+
+class BrowserStateRequest(BaseModel):
+    include_screenshot: bool = Field(False, description="Whether to include a screenshot")
+    session_id: str = Field("default", description="Browser session ID")
+
+class BrowserKeyRequest(BaseModel):
+    key: str = Field(..., description="The key to press (e.g., 'Enter', 'Escape', 'Tab', 'Space')")
+    session_id: str = Field("default", description="Browser session ID")
+
+class BrowserScrollRequest(BaseModel):
+    direction: str = Field("down", description="Direction to scroll ('up' or 'down')")
+    session_id: str = Field("default", description="Browser session ID")
+
+class BrowserExtractContentRequest(BaseModel):
+    query: str = Field(..., description="What information to extract from the page")
+    extract_links: bool = Field(False, description="Whether to include links in the extraction")
+    session_id: str = Field("default", description="Browser session ID")
+
+class BrowserGoBackRequest(BaseModel):
+    session_id: str = Field("default", description="Browser session ID")
+
+class BrowserListTabsRequest(BaseModel):
+    session_id: str = Field("default", description="Browser session ID")
+
+class BrowserSwitchTabRequest(BaseModel):
+    tab_index: int = Field(..., description="Index of the tab to switch to")
+    session_id: str = Field("default", description="Browser session ID")
+
+class BrowserCloseTabRequest(BaseModel):
+    tab_index: int = Field(..., description="Index of the tab to close")
+    session_id: str = Field("default", description="Browser session ID")
+
+class RetryWithAgentRequest(BaseModel):
+    task: str = Field(..., description="High-level goal and detailed task description")
+    max_steps: int = Field(100, description="Maximum number of steps the agent can take")
+    model: str = Field("gpt-4o", description="LLM model to use")
+    allowed_domains: List[str] = Field([], description="List of domains the agent is allowed to visit")
+    use_vision: bool = Field(True, description="Whether to use vision capabilities")
+    session_id: str = Field("default", description="Browser session ID")
+
+class CreateSessionRequest(BaseModel):
+    session_id: Optional[str] = Field(None, description="Custom session ID")
+    headless: bool = Field(True, description="Whether to run browser in headless mode")
+    allowed_domains: List[str] = Field([], description="List of allowed domains")
+    wait_between_actions: float = Field(0.5, description="Wait time between actions")
+
+class AgentTaskRequest(BaseModel):
+    task: str = Field(..., description="The task description for the agent")
+    max_steps: int = Field(100, description="Maximum number of steps")
+    model: str = Field("gpt-4o", description="LLM model to use")
+    session_id: str = Field("default", description="Browser session ID")
+
+class SessionResponse(BaseModel):
+    session_id: str
+    status: str
+    message: str
+
+class TaskResponse(BaseModel):
+    task_id: str
+    status: str
+    message: str
+    session_id: str
+
+class BrowserStateResponse(BaseModel):
+    url: str
+    title: str
+    tabs: List[Dict[str, str]]
+    interactive_elements: List[Dict[str, Any]]
+    screenshot: Optional[str] = None
 
 # Global state management
 class ServerState:
@@ -74,9 +135,6 @@ class ServerState:
         self.agents: Dict[str, Agent] = {}
         self.controllers: Dict[str, Controller] = {}
         self.file_systems: Dict[str, FileSystem] = {}
-        self.config = load_browser_use_config()
-        self.telemetry = ProductTelemetry()
-        self.start_time = time.time()
 
     async def cleanup(self):
         """Clean up all active sessions"""
@@ -97,17 +155,6 @@ class ServerState:
                 logger.debug(f"Closed browser session {session_id}")
             except Exception as e:
                 logger.error(f"Error closing browser session {session_id}: {e}")
-        
-        # Capture telemetry for server stop
-        duration = time.time() - self.start_time
-        self.telemetry.capture(
-            APIServerTelemetryEvent(
-                version=get_browser_use_version(),
-                action='stop',
-                duration_seconds=duration,
-            )
-        )
-        self.telemetry.flush()
 
 # Global server state
 server_state = ServerState()
@@ -116,106 +163,17 @@ server_state = ServerState()
 async def lifespan(app: FastAPI):
     """Handle server startup and shutdown"""
     # Startup
-    logger.info("Starting browser-use API server")
-    server_state.telemetry.capture(
-        APIServerTelemetryEvent(
-            version=get_browser_use_version(),
-            action='start',
-        )
-    )
-    
+    logger.info("Starting standalone browser-use API server")
     yield
-    
     # Shutdown
     await server_state.cleanup()
-
-# Pydantic models for API requests and responses
-
-class BrowserNavigateRequest(BaseModel):
-    url: str = Field(..., description="The URL to navigate to")
-    new_tab: bool = Field(False, description="Whether to open in a new tab")
-    session_id: str = Field("default", description="Browser session ID")
-
-class BrowserClickRequest(BaseModel):
-    index: int = Field(..., description="The index of the element to click")
-    new_tab: bool = Field(False, description="Whether to open in a new tab")
-    session_id: str = Field("default", description="Browser session ID")
-
-class BrowserTypeRequest(BaseModel):
-    index: int = Field(..., description="The index of the input element")
-    text: str = Field(..., description="The text to type")
-    session_id: str = Field("default", description="Browser session ID")
-
-class BrowserStateRequest(BaseModel):
-    include_screenshot: bool = Field(False, description="Whether to include a screenshot")
-    session_id: str = Field("default", description="Browser session ID")
-
-class BrowserExtractRequest(BaseModel):
-    query: str = Field(..., description="What information to extract from the page")
-    extract_links: bool = Field(False, description="Whether to include links in the extraction")
-    session_id: str = Field("default", description="Browser session ID")
-
-class BrowserScrollRequest(BaseModel):
-    direction: Annotated[str, Field(description="Direction to scroll")] = "down"
-    session_id: str = "default"
-    
-    class Config:
-        schema_extra = {
-            "properties": {
-                "direction": {"enum": ["up", "down"]}
-            }
-        }
-
-class BrowserTabRequest(BaseModel):
-    session_id: str = Field("default", description="Browser session ID")
-
-class BrowserSwitchTabRequest(BaseModel):
-    tab_index: int = Field(..., description="Index of the tab to switch to")
-    session_id: str = Field("default", description="Browser session ID")
-
-class BrowserCloseTabRequest(BaseModel):
-    tab_index: int = Field(..., description="Index of the tab to close")
-    session_id: str = Field("default", description="Browser session ID")
-
-class AgentTaskRequest(BaseModel):
-    task: str = Field(..., description="The task description for the agent")
-    max_steps: int = Field(100, description="Maximum number of steps the agent can take")
-    model: str = Field("gpt-4o", description="LLM model to use")
-    allowed_domains: List[str] = Field([], description="List of allowed domains")
-    use_vision: bool = Field(True, description="Whether to use vision capabilities")
-    session_id: str = Field("default", description="Browser session ID")
-
-class CreateSessionRequest(BaseModel):
-    session_id: Optional[str] = Field(None, description="Custom session ID (auto-generated if not provided)")
-    headless: bool = Field(True, description="Whether to run browser in headless mode")
-    allowed_domains: List[str] = Field([], description="List of allowed domains")
-    wait_between_actions: float = Field(0.5, description="Wait time between actions")
-    user_data_dir: Optional[str] = Field(None, description="Custom user data directory")
-
-class SessionResponse(BaseModel):
-    session_id: str
-    status: str
-    message: str
-
-class TaskResponse(BaseModel):
-    task_id: str
-    status: str
-    message: str
-    session_id: str
-
-class BrowserStateResponse(BaseModel):
-    url: str
-    title: str
-    tabs: List[Dict[str, str]]
-    interactive_elements: List[Dict[str, Any]]
-    screenshot: Optional[str] = None
 
 # Create FastAPI app
 def create_app() -> FastAPI:
     app = FastAPI(
-        title="Browser-Use API",
-        description="REST API for browser automation capabilities",
-        version=get_browser_use_version(),
+        title="Browser-Use Standalone API",
+        description="Standalone REST API for browser automation capabilities",
+        version="0.1.0",
         lifespan=lifespan
     )
 
@@ -231,18 +189,46 @@ def create_app() -> FastAPI:
     @app.get("/")
     async def root():
         return {
-            "message": "Browser-Use API Server",
-            "version": get_browser_use_version(),
-            "docs": "/docs"
+            "message": "Browser-Use Standalone API Server",
+            "version": "0.1.0",
+            "docs": "/docs",
+            "note": "Set OPENAI_API_KEY environment variable for agent functionality",
+            "capabilities": [
+                "Browser navigation and control",
+                "Element clicking and typing",
+                "Keyboard input and scrolling", 
+                "Content extraction with LLM",
+                "Tab management",
+                "Browser history navigation",
+                "Autonomous agent tasks"
+            ]
         }
 
     @app.get("/health")
     async def health_check():
+        api_key_status = "set" if os.getenv('OPENAI_API_KEY') else "not set"
         return {
             "status": "healthy",
             "active_sessions": len(server_state.browser_sessions),
-            "active_agents": len(server_state.agents)
+            "active_agents": len(server_state.agents),
+            "openai_api_key": api_key_status
         }
+
+    # Helper function to get or create session
+    async def get_session(session_id: str) -> BrowserSession:
+        if session_id not in server_state.browser_sessions:
+            if session_id == "default":
+                # Create default session with sensible defaults
+                default_request = CreateSessionRequest(
+                    session_id="default",
+                    headless=True,
+                    allowed_domains=[],
+                    wait_between_actions=0.5
+                )
+                await create_session(default_request)
+            else:
+                raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        return server_state.browser_sessions[session_id]
 
     # Session management endpoints
     @app.post("/sessions", response_model=SessionResponse)
@@ -254,21 +240,16 @@ def create_app() -> FastAPI:
             if session_id in server_state.browser_sessions:
                 raise HTTPException(status_code=400, detail=f"Session {session_id} already exists")
 
-            # Get profile config and merge with request parameters
-            profile_config = get_default_profile(server_state.config)
+            # Create browser profile with basic settings
+            profile = BrowserProfile(
+                downloads_path=str(Path.home() / 'Downloads' / 'browser-use-api'),
+                wait_between_actions=request.wait_between_actions,
+                keep_alive=True,
+                user_data_dir='~/.config/browseruse/profiles/api',
+                headless=request.headless,
+                allowed_domains=request.allowed_domains,
+            )
             
-            profile_data = {
-                'downloads_path': str(Path.home() / 'Downloads' / 'browser-use-api'),
-                'wait_between_actions': request.wait_between_actions,
-                'keep_alive': True,
-                'user_data_dir': request.user_data_dir or '~/.config/browseruse/profiles/api',
-                'headless': request.headless,
-                'allowed_domains': request.allowed_domains,
-                **profile_config,
-            }
-
-            # Create browser profile and session
-            profile = BrowserProfile(**profile_data)
             session = BrowserSession(browser_profile=profile)
             await session.start()
 
@@ -277,8 +258,8 @@ def create_app() -> FastAPI:
             server_state.controllers[session_id] = Controller()
 
             # Initialize FileSystem
-            file_system_path = profile_config.get('file_system_path', '~/.browser-use-api')
-            server_state.file_systems[session_id] = FileSystem(base_dir=Path(file_system_path).expanduser())
+            file_system_path = Path.home() / '.browser-use-api'
+            server_state.file_systems[session_id] = FileSystem(base_dir=file_system_path)
 
             logger.info(f"Created browser session {session_id}")
             
@@ -345,24 +326,6 @@ def create_app() -> FastAPI:
         
         return {"sessions": sessions}
 
-    # Helper function to get or create session
-    async def get_session(session_id: str) -> BrowserSession:
-        # Auto-create default session
-        if session_id not in server_state.browser_sessions:
-            if session_id == "default":
-                # Create default session with sensible defaults
-                default_request = CreateSessionRequest(
-                    session_id="default",
-                    headless=True,
-                    allowed_domains=[],
-                    wait_between_actions=0.5,
-                    user_data_dir=None
-                )
-                await create_session(default_request)
-            else:
-                raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
-        return server_state.browser_sessions[session_id]
-
     # Browser control endpoints
     @app.post("/browser/navigate")
     async def browser_navigate(request: BrowserNavigateRequest):
@@ -394,36 +357,8 @@ def create_app() -> FastAPI:
             if not element:
                 raise HTTPException(status_code=404, detail=f'Element with index {request.index} not found')
 
-            if request.new_tab:
-                # Handle new tab logic (similar to MCP server)
-                href = element.attributes.get('href')
-                if href:
-                    from urllib.parse import urlparse
-                    current_page = await session.get_current_page()
-                    if href.startswith('/'):
-                        parsed = urlparse(current_page.url)
-                        full_url = f'{parsed.scheme}://{parsed.netloc}{href}'
-                    else:
-                        full_url = href
-
-                    page = await session.create_new_tab(full_url)
-                    tab_idx = session.tabs.index(page)
-                    message = f'Clicked element {request.index} and opened in new tab #{tab_idx}'
-                else:
-                    # Ctrl/Cmd+Click for non-links
-                    element_handle = await session.get_locate_element(element)
-                    if element_handle:
-                        modifier = 'Meta' if sys.platform == 'darwin' else 'Control'
-                        await element_handle.click(modifiers=[modifier])
-                        await asyncio.sleep(0.5)
-                        message = f'Clicked element {request.index} with {modifier} key (new tab if supported)'
-                    else:
-                        raise HTTPException(status_code=500, detail=f'Could not locate element {request.index} for modified click')
-            else:
-                await session._click_element_node(element)
-                message = f'Clicked element {request.index}'
-
-            return {"message": message}
+            await session._click_element_node(element)
+            return {"message": f'Clicked element {request.index}'}
 
         except Exception as e:
             logger.error(f"Error clicking element: {e}")
@@ -444,6 +379,244 @@ def create_app() -> FastAPI:
 
         except Exception as e:
             logger.error(f"Error typing text: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/browser/key")
+    async def browser_key(request: BrowserKeyRequest):
+        """Press a keyboard key"""
+        try:
+            session = await get_session(request.session_id)
+            page = await session.get_current_page()
+            
+            # Press the specified key
+            await page.keyboard.press(request.key)
+            
+            return {"message": f"Pressed key: {request.key}"}
+
+        except Exception as e:
+            logger.error(f"Error pressing key: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/browser/scroll")
+    async def browser_scroll(request: BrowserScrollRequest):
+        """Scroll the page"""
+        try:
+            session = await get_session(request.session_id)
+            page = await session.get_current_page()
+            
+            # Validate direction
+            if request.direction not in ["up", "down"]:
+                raise HTTPException(status_code=400, detail="Direction must be 'up' or 'down'")
+            
+            # Get viewport height for scrolling
+            viewport_height = await page.evaluate('() => window.innerHeight')
+            
+            # Calculate scroll distance (positive for down, negative for up)
+            scroll_distance = viewport_height if request.direction == "down" else -viewport_height
+            
+            # Perform the scroll
+            await page.evaluate('(distance) => window.scrollBy(0, distance)', scroll_distance)
+            
+            return {"message": f"Scrolled {request.direction} by {abs(scroll_distance)} pixels"}
+
+        except Exception as e:
+            logger.error(f"Error scrolling: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/browser/extract_content")
+    async def browser_extract_content(request: BrowserExtractContentRequest):
+        """Extract structured content from the current page"""
+        try:
+            session = await get_session(request.session_id)
+            
+            # Get API key for LLM
+            api_key = os.getenv('OPENAI_API_KEY')
+            if not api_key:
+                raise HTTPException(status_code=400, detail='OPENAI_API_KEY environment variable not set for content extraction')
+
+            # Get controller and file system
+            controller = server_state.controllers.get(request.session_id)
+            file_system = server_state.file_systems.get(request.session_id)
+            
+            if not controller or not file_system:
+                raise HTTPException(status_code=500, detail='Controller or FileSystem not initialized for session')
+
+            # Create LLM for extraction
+            llm = ChatOpenAI(
+                model="gpt-4o-mini",  # Using mini for content extraction to reduce costs
+                api_key=api_key,
+                temperature=0.7,
+            )
+
+            # Use the extract_structured_data action
+            from pydantic import create_model
+            from browser_use import ActionModel
+
+            # Create action model dynamically
+            ExtractAction = create_model(
+                'ExtractAction',
+                __base__=ActionModel,
+                extract_structured_data=(dict[str, Any], {'query': request.query, 'extract_links': request.extract_links}),
+            )
+
+            action = ExtractAction()
+            action_result = await controller.act(
+                action=action,
+                browser_session=session,
+                page_extraction_llm=llm,
+                file_system=file_system,
+            )
+
+            extracted_content = action_result.extracted_content or 'No content extracted'
+            
+            return {"extracted_content": extracted_content}
+
+        except Exception as e:
+            logger.error(f"Error extracting content: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/browser/go_back")
+    async def browser_go_back(request: BrowserGoBackRequest):
+        """Go back to the previous page"""
+        try:
+            session = await get_session(request.session_id)
+            await session.go_back()
+            return {"message": "Navigated back"}
+
+        except Exception as e:
+            logger.error(f"Error going back: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/browser/list_tabs")
+    async def browser_list_tabs(request: BrowserListTabsRequest):
+        """List all open tabs"""
+        try:
+            session = await get_session(request.session_id)
+            
+            tabs = []
+            for i, tab in enumerate(session.tabs):
+                try:
+                    tab_info = {
+                        'index': i, 
+                        'url': tab.url, 
+                        'title': await tab.title() if not tab.is_closed() else 'Closed'
+                    }
+                except Exception:
+                    tab_info = {
+                        'index': i,
+                        'url': 'Unknown',
+                        'title': 'Error getting tab info'
+                    }
+                tabs.append(tab_info)
+            
+            return {"tabs": tabs}
+
+        except Exception as e:
+            logger.error(f"Error listing tabs: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/browser/switch_tab")
+    async def browser_switch_tab(request: BrowserSwitchTabRequest):
+        """Switch to a different tab"""
+        try:
+            session = await get_session(request.session_id)
+            
+            if request.tab_index < 0 or request.tab_index >= len(session.tabs):
+                raise HTTPException(status_code=400, detail=f"Invalid tab index: {request.tab_index}")
+            
+            await session.switch_to_tab(request.tab_index)
+            page = await session.get_current_page()
+            
+            return {"message": f"Switched to tab {request.tab_index}: {page.url}"}
+
+        except Exception as e:
+            logger.error(f"Error switching tab: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/browser/close_tab")
+    async def browser_close_tab(request: BrowserCloseTabRequest):
+        """Close a specific tab"""
+        try:
+            session = await get_session(request.session_id)
+            
+            if request.tab_index < 0 or request.tab_index >= len(session.tabs):
+                raise HTTPException(status_code=400, detail=f"Invalid tab index: {request.tab_index}")
+            
+            tab = session.tabs[request.tab_index]
+            url = tab.url
+            await tab.close()
+            
+            return {"message": f"Closed tab {request.tab_index}: {url}"}
+
+        except Exception as e:
+            logger.error(f"Error closing tab: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/browser/retry_with_agent")
+    async def retry_with_browser_use_agent(request: RetryWithAgentRequest, background_tasks: BackgroundTasks):
+        """Retry a task using the browser-use agent as fallback"""
+        try:
+            # Get API key for LLM
+            api_key = os.getenv('OPENAI_API_KEY')
+            if not api_key:
+                raise HTTPException(status_code=400, detail='OPENAI_API_KEY environment variable not set')
+
+            # Create LLM
+            llm = ChatOpenAI(
+                model=request.model,
+                api_key=api_key,
+                temperature=0.7,
+            )
+
+            # Create browser profile with allowed domains
+            profile = BrowserProfile(
+                downloads_path=str(Path.home() / 'Downloads' / 'browser-use-api'),
+                wait_between_actions=0.5,
+                keep_alive=True,
+                user_data_dir='~/.config/browseruse/profiles/api-agent',
+                headless=True,
+                allowed_domains=request.allowed_domains,
+            )
+
+            # Create and run agent
+            agent = Agent(
+                task=request.task,
+                llm=llm,
+                browser_profile=profile,
+                use_vision=request.use_vision,
+            )
+
+            # Generate unique task ID
+            task_id = f"retry_task_{int(time.time() * 1000)}"
+            
+            # Store agent (will replace if session_id exists)
+            server_state.agents[task_id] = agent
+
+            # Run agent in background
+            async def run_retry_agent():
+                try:
+                    history = await agent.run(max_steps=request.max_steps)
+                    logger.info(f"Retry agent task {task_id} completed. Success: {history.is_successful()}")
+                except Exception as e:
+                    logger.error(f"Retry agent task {task_id} failed: {e}")
+                finally:
+                    # Clean up agent
+                    try:
+                        await agent.close()
+                    except Exception as e:
+                        logger.error(f"Error closing retry agent {task_id}: {e}")
+
+            background_tasks.add_task(run_retry_agent)
+
+            return {
+                "task_id": task_id,
+                "status": "started",
+                "message": f"Retry agent task {task_id} started with {request.max_steps} max steps",
+                "session_id": request.session_id
+            }
+
+        except Exception as e:
+            logger.error(f"Error running retry agent: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post("/browser/state", response_model=BrowserStateResponse)
@@ -483,130 +656,6 @@ def create_app() -> FastAPI:
             logger.error(f"Error getting browser state: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    @app.post("/browser/extract")
-    async def browser_extract_content(request: BrowserExtractRequest):
-        """Extract content from current page"""
-        try:
-            session = await get_session(request.session_id)
-            
-            # Need LLM for extraction
-            llm_config = get_default_llm(server_state.config)
-            api_key = llm_config.get('api_key') or os.getenv('OPENAI_API_KEY')
-            if not api_key:
-                raise HTTPException(status_code=400, detail='OPENAI_API_KEY not set in config or environment')
-
-            llm = ChatOpenAI(
-                model=llm_config.get('model', 'gpt-4o'),
-                api_key=api_key,
-                temperature=llm_config.get('temperature', 0.7),
-            )
-
-            controller = server_state.controllers[request.session_id]
-            file_system = server_state.file_systems[request.session_id]
-
-            # Create dynamic action model for extraction
-            from pydantic import create_model
-            ExtractAction = create_model(
-                'ExtractAction',
-                __base__=ActionModel,
-                extract_structured_data=(dict[str, Any], {'query': request.query, 'extract_links': request.extract_links}),
-            )
-
-            action = ExtractAction()
-            action_result = await controller.act(
-                action=action,
-                browser_session=session,
-                page_extraction_llm=llm,
-                file_system=file_system,
-            )
-
-            content = action_result.extracted_content or 'No content extracted'
-            return {"content": content}
-
-        except Exception as e:
-            logger.error(f"Error extracting content: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    @app.post("/browser/scroll")
-    async def browser_scroll(request: BrowserScrollRequest):
-        """Scroll the page"""
-        try:
-            session = await get_session(request.session_id)
-            
-            page = await session.get_current_page()
-            viewport_height = await page.evaluate('() => window.innerHeight')
-            dy = viewport_height if request.direction == 'down' else -viewport_height
-
-            await page.evaluate('(y) => window.scrollBy(0, y)', dy)
-            return {"message": f'Scrolled {request.direction}'}
-
-        except Exception as e:
-            logger.error(f"Error scrolling: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    @app.post("/browser/back")
-    async def browser_go_back(request: BrowserTabRequest):
-        """Go back in browser history"""
-        try:
-            session = await get_session(request.session_id)
-            await session.go_back()
-            return {"message": 'Navigated back'}
-
-        except Exception as e:
-            logger.error(f"Error going back: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    @app.get("/browser/tabs")
-    async def browser_list_tabs(session_id: str = "default"):
-        """List all open tabs"""
-        try:
-            session = await get_session(session_id)
-            
-            tabs = []
-            for i, tab in enumerate(session.tabs):
-                tabs.append({
-                    'index': i, 
-                    'url': tab.url, 
-                    'title': await tab.title() if not tab.is_closed() else 'Closed'
-                })
-            return {"tabs": tabs}
-
-        except Exception as e:
-            logger.error(f"Error listing tabs: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    @app.post("/browser/tabs/switch")
-    async def browser_switch_tab(request: BrowserSwitchTabRequest):
-        """Switch to a different tab"""
-        try:
-            session = await get_session(request.session_id)
-            
-            await session.switch_to_tab(request.tab_index)
-            page = await session.get_current_page()
-            return {"message": f'Switched to tab {request.tab_index}: {page.url}'}
-
-        except Exception as e:
-            logger.error(f"Error switching tab: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    @app.post("/browser/tabs/close")
-    async def browser_close_tab(request: BrowserCloseTabRequest):
-        """Close a specific tab"""
-        try:
-            session = await get_session(request.session_id)
-            
-            if 0 <= request.tab_index < len(session.tabs):
-                tab = session.tabs[request.tab_index]
-                url = tab.url
-                await tab.close()
-                return {"message": f'Closed tab {request.tab_index}: {url}'}
-            else:
-                raise HTTPException(status_code=400, detail=f'Invalid tab index: {request.tab_index}')
-
-        except Exception as e:
-            logger.error(f"Error closing tab: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
     # Agent endpoints
     @app.post("/agent/task", response_model=TaskResponse)
     async def run_agent_task(request: AgentTaskRequest, background_tasks: BackgroundTasks):
@@ -614,16 +663,15 @@ def create_app() -> FastAPI:
         try:
             session = await get_session(request.session_id)
             
-            # Get LLM config
-            llm_config = get_default_llm(server_state.config)
-            api_key = llm_config.get('api_key') or os.getenv('OPENAI_API_KEY')
+            # Get API key from environment
+            api_key = os.getenv('OPENAI_API_KEY')
             if not api_key:
-                raise HTTPException(status_code=400, detail='OPENAI_API_KEY not set in config or environment')
+                raise HTTPException(status_code=400, detail='OPENAI_API_KEY environment variable not set')
 
             llm = ChatOpenAI(
                 model=request.model,
                 api_key=api_key,
-                temperature=llm_config.get('temperature', 0.7),
+                temperature=0.7,
             )
 
             # Create agent
@@ -631,7 +679,6 @@ def create_app() -> FastAPI:
                 task=request.task,
                 llm=llm,
                 browser_session=session,
-                use_vision=request.use_vision,
             )
 
             # Store agent
@@ -706,15 +753,19 @@ def main():
     """Main entry point for running the server"""
     import argparse
     
-    parser = argparse.ArgumentParser(description="Browser-Use FastAPI Server")
+    parser = argparse.ArgumentParser(description="Browser-Use Standalone FastAPI Server")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
     
     args = parser.parse_args()
     
+    print(f"Starting Browser-Use Standalone API server on {args.host}:{args.port}")
+    print(f"API docs will be available at: http://{args.host}:{args.port}/docs")
+    print(f"Set OPENAI_API_KEY environment variable for agent functionality")
+    
     uvicorn.run(
-        "browser_use.api.server:app",
+        "browser_use.api.standalone_server:app",
         host=args.host,
         port=args.port,
         reload=args.reload

@@ -37,6 +37,7 @@ try:
     from browser_use.filesystem.file_system import FileSystem
     from browser_use.llm.openai.chat import ChatOpenAI
     from browser_use.agent.service import Agent
+    from browser_use import ActionModel
 except ImportError as e:
     logger.error(f"Failed to import browser_use modules: {e}")
     logger.error("Make sure you have browser-use installed with: pip install browser-use")
@@ -69,6 +70,40 @@ class BrowserKeyRequest(BaseModel):
 class BrowserScrollRequest(BaseModel):
     direction: str = Field("down", description="Direction to scroll ('up' or 'down')")
     session_id: str = Field("default", description="Browser session ID")
+
+class BrowserExtractContentRequest(BaseModel):
+    query: str = Field(..., description="What information to extract from the page")
+    extract_links: bool = Field(False, description="Whether to include links in the extraction")
+    session_id: str = Field("default", description="Browser session ID")
+
+class BrowserGoBackRequest(BaseModel):
+    session_id: str = Field("default", description="Browser session ID")
+
+class BrowserListTabsRequest(BaseModel):
+    session_id: str = Field("default", description="Browser session ID")
+
+class BrowserSwitchTabRequest(BaseModel):
+    tab_index: int = Field(..., description="Index of the tab to switch to")
+    session_id: str = Field("default", description="Browser session ID")
+
+class BrowserCloseTabRequest(BaseModel):
+    tab_index: int = Field(..., description="Index of the tab to close")
+    session_id: str = Field("default", description="Browser session ID")
+
+class RetryWithAgentRequest(BaseModel):
+    task: str = Field(..., description="High-level goal and detailed task description")
+    max_steps: int = Field(100, description="Maximum number of steps the agent can take")
+    model: str = Field("gpt-4o", description="LLM model to use")
+    allowed_domains: List[str] = Field([], description="List of domains the agent is allowed to visit")
+    use_vision: bool = Field(True, description="Whether to use vision capabilities")
+    session_id: str = Field("default", description="Browser session ID")
+
+class CloseSessionRequest(BaseModel):
+    session_id: str = Field(..., description="Browser session ID to close")
+
+class MCPRequest(BaseModel):
+    tool_name: str = Field(..., description="Name of the tool to execute")
+    parameters: Dict[str, Any] = Field(..., description="Parameters for the tool")
 
 class CreateSessionRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="Custom session ID")
@@ -164,7 +199,22 @@ def create_app() -> FastAPI:
             "message": "Browser-Use Standalone API Server",
             "version": "0.1.0",
             "docs": "/docs",
-            "note": "Set OPENAI_API_KEY environment variable for agent functionality"
+            "mcp_endpoint": "/mcp",
+            "note": "Set OPENAI_API_KEY environment variable for agent functionality",
+            "capabilities": [
+                "Browser navigation and control",
+                "Element clicking and typing",
+                "Keyboard input and scrolling", 
+                "Content extraction with LLM",
+                "Tab management",
+                "Browser history navigation",
+                "Autonomous agent tasks"
+            ],
+            "endpoints": {
+                "unified_mcp": "POST /mcp - Single endpoint for all tools",
+                "individual": "Original REST endpoints still available",
+                "docs": "GET /docs - Interactive API documentation"
+            }
         }
 
     @app.get("/health")
@@ -236,10 +286,11 @@ def create_app() -> FastAPI:
             logger.error(f"Error creating session: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    @app.delete("/sessions/{session_id}")
-    async def close_session(session_id: str):
+    @app.post("/sessions/close")
+    async def close_session(request: CloseSessionRequest):
         """Close a browser session"""
         try:
+            session_id = request.session_id
             if session_id not in server_state.browser_sessions:
                 raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
 
@@ -288,6 +339,137 @@ def create_app() -> FastAPI:
                 })
         
         return {"sessions": sessions}
+
+    # Unified MCP endpoint
+    @app.post("/mcp")
+    async def mcp_endpoint(request: MCPRequest, background_tasks: BackgroundTasks):
+        """Unified MCP endpoint that routes to appropriate tools based on tool_name"""
+        try:
+            tool_name = request.tool_name
+            parameters = request.parameters
+            
+            # Session management tools
+            if tool_name == "create_browser_session":
+                create_req = CreateSessionRequest(**parameters)
+                return await create_session(create_req)
+            
+            elif tool_name == "list_browser_sessions":
+                return await list_sessions()
+            
+            elif tool_name == "close_browser_session":
+                close_req = CloseSessionRequest(**parameters)
+                return await close_session(close_req)
+            
+            # Browser navigation tools
+            elif tool_name == "browser_navigate":
+                nav_req = BrowserNavigateRequest(**parameters)
+                return await browser_navigate(nav_req)
+            
+            elif tool_name == "browser_click":
+                click_req = BrowserClickRequest(**parameters)
+                return await browser_click(click_req)
+            
+            elif tool_name == "browser_type":
+                type_req = BrowserTypeRequest(**parameters)
+                return await browser_type(type_req)
+            
+            elif tool_name == "browser_key":
+                key_req = BrowserKeyRequest(**parameters)
+                return await browser_key(key_req)
+            
+            elif tool_name == "browser_scroll":
+                scroll_req = BrowserScrollRequest(**parameters)
+                return await browser_scroll(scroll_req)
+            
+            elif tool_name == "browser_get_state":
+                state_req = BrowserStateRequest(**parameters)
+                return await get_browser_state(state_req)
+            
+            # Content extraction tool
+            elif tool_name == "browser_extract_content":
+                extract_req = BrowserExtractContentRequest(**parameters)
+                return await browser_extract_content(extract_req)
+            
+            # Browser navigation tools
+            elif tool_name == "browser_go_back":
+                back_req = BrowserGoBackRequest(**parameters)
+                return await browser_go_back(back_req)
+            
+            # Tab management tools
+            elif tool_name == "browser_list_tabs":
+                list_tabs_req = BrowserListTabsRequest(**parameters)
+                return await browser_list_tabs(list_tabs_req)
+            
+            elif tool_name == "browser_switch_tab":
+                switch_req = BrowserSwitchTabRequest(**parameters)
+                return await browser_switch_tab(switch_req)
+            
+            elif tool_name == "browser_close_tab":
+                close_tab_req = BrowserCloseTabRequest(**parameters)
+                return await browser_close_tab(close_tab_req)
+            
+            # Agent tools
+            elif tool_name == "browse_agent":
+                agent_req = AgentTaskRequest(**parameters)
+                return await run_agent_task(agent_req, background_tasks)
+            
+            elif tool_name == "retry_browse_agent":
+                retry_req = RetryWithAgentRequest(**parameters)
+                return await retry_with_browser_use_agent(retry_req, background_tasks)
+            
+            elif tool_name == "get_agent_task_status":
+                task_id = parameters.get("task_id")
+                if not task_id:
+                    raise HTTPException(status_code=400, detail="task_id parameter required")
+                return await get_agent_task_status(task_id)
+            
+            else:
+                raise HTTPException(status_code=400, detail=f"Unknown tool: {tool_name}")
+                
+        except Exception as e:
+            logger.error(f"Error in MCP endpoint for tool {request.tool_name}: {e}")
+            if isinstance(e, HTTPException):
+                raise e
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/mcp")
+    async def mcp_get_endpoint():
+        """GET endpoint for MCP - returns available tools"""
+        return {
+            "message": "MCP Unified Endpoint",
+            "method": "POST",
+            "endpoint": "/mcp",
+            "description": "Send tool requests with tool_name and parameters",
+            "available_tools": [
+                # Session management
+                "create_browser_session",
+                "list_browser_sessions", 
+                "close_browser_session",
+                # Browser control
+                "browser_navigate",
+                "browser_click",
+                "browser_type",
+                "browser_key",
+                "browser_scroll",
+                "browser_get_state",
+                # Content extraction
+                "browser_extract_content",
+                # Navigation
+                "browser_go_back",
+                # Tab management
+                "browser_list_tabs",
+                "browser_switch_tab",
+                "browser_close_tab",
+                # Agent tasks
+                "run_agent_task",
+                "retry_with_browser_use_agent",
+                "get_agent_task_status"
+            ],
+            "schema": {
+                "tool_name": "string (required)",
+                "parameters": "object (required) - parameters specific to each tool"
+            }
+        }
 
     # Browser control endpoints
     @app.post("/browser/navigate")
@@ -344,6 +526,22 @@ def create_app() -> FastAPI:
             logger.error(f"Error typing text: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
+    @app.post("/browser/key")
+    async def browser_key(request: BrowserKeyRequest):
+        """Press a keyboard key"""
+        try:
+            session = await get_session(request.session_id)
+            page = await session.get_current_page()
+            
+            # Press the specified key
+            await page.keyboard.press(request.key)
+            
+            return {"message": f"Pressed key: {request.key}"}
+
+        except Exception as e:
+            logger.error(f"Error pressing key: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
     @app.post("/browser/scroll")
     async def browser_scroll(request: BrowserScrollRequest):
         """Scroll the page"""
@@ -368,6 +566,202 @@ def create_app() -> FastAPI:
 
         except Exception as e:
             logger.error(f"Error scrolling: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/browser/extract_content")
+    async def browser_extract_content(request: BrowserExtractContentRequest):
+        """Extract structured content from the current page"""
+        try:
+            session = await get_session(request.session_id)
+            
+            # Get API key for LLM
+            api_key = os.getenv('OPENAI_API_KEY')
+            if not api_key:
+                raise HTTPException(status_code=400, detail='OPENAI_API_KEY environment variable not set for content extraction')
+
+            # Get controller and file system
+            controller = server_state.controllers.get(request.session_id)
+            file_system = server_state.file_systems.get(request.session_id)
+            
+            if not controller or not file_system:
+                raise HTTPException(status_code=500, detail='Controller or FileSystem not initialized for session')
+
+            # Create LLM for extraction
+            llm = ChatOpenAI(
+                model="gpt-4o-mini",  # Using mini for content extraction to reduce costs
+                api_key=api_key,
+                temperature=0.7,
+            )
+
+            # Use the extract_structured_data action
+            from pydantic import create_model
+            from browser_use import ActionModel
+
+            # Create action model dynamically
+            ExtractAction = create_model(
+                'ExtractAction',
+                __base__=ActionModel,
+                extract_structured_data=(dict[str, Any], {'query': request.query, 'extract_links': request.extract_links}),
+            )
+
+            action = ExtractAction()
+            action_result = await controller.act(
+                action=action,
+                browser_session=session,
+                page_extraction_llm=llm,
+                file_system=file_system,
+            )
+
+            extracted_content = action_result.extracted_content or 'No content extracted'
+            
+            return {"extracted_content": extracted_content}
+
+        except Exception as e:
+            logger.error(f"Error extracting content: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/browser/go_back")
+    async def browser_go_back(request: BrowserGoBackRequest):
+        """Go back to the previous page"""
+        try:
+            session = await get_session(request.session_id)
+            await session.go_back()
+            return {"message": "Navigated back"}
+
+        except Exception as e:
+            logger.error(f"Error going back: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/browser/list_tabs")
+    async def browser_list_tabs(request: BrowserListTabsRequest):
+        """List all open tabs"""
+        try:
+            session = await get_session(request.session_id)
+            
+            tabs = []
+            for i, tab in enumerate(session.tabs):
+                try:
+                    tab_info = {
+                        'index': i, 
+                        'url': tab.url, 
+                        'title': await tab.title() if not tab.is_closed() else 'Closed'
+                    }
+                except Exception:
+                    tab_info = {
+                        'index': i,
+                        'url': 'Unknown',
+                        'title': 'Error getting tab info'
+                    }
+                tabs.append(tab_info)
+            
+            return {"tabs": tabs}
+
+        except Exception as e:
+            logger.error(f"Error listing tabs: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/browser/switch_tab")
+    async def browser_switch_tab(request: BrowserSwitchTabRequest):
+        """Switch to a different tab"""
+        try:
+            session = await get_session(request.session_id)
+            
+            if request.tab_index < 0 or request.tab_index >= len(session.tabs):
+                raise HTTPException(status_code=400, detail=f"Invalid tab index: {request.tab_index}")
+            
+            await session.switch_to_tab(request.tab_index)
+            page = await session.get_current_page()
+            
+            return {"message": f"Switched to tab {request.tab_index}: {page.url}"}
+
+        except Exception as e:
+            logger.error(f"Error switching tab: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/browser/close_tab")
+    async def browser_close_tab(request: BrowserCloseTabRequest):
+        """Close a specific tab"""
+        try:
+            session = await get_session(request.session_id)
+            
+            if request.tab_index < 0 or request.tab_index >= len(session.tabs):
+                raise HTTPException(status_code=400, detail=f"Invalid tab index: {request.tab_index}")
+            
+            tab = session.tabs[request.tab_index]
+            url = tab.url
+            await tab.close()
+            
+            return {"message": f"Closed tab {request.tab_index}: {url}"}
+
+        except Exception as e:
+            logger.error(f"Error closing tab: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/browser/retry_with_agent")
+    async def retry_with_browser_use_agent(request: RetryWithAgentRequest, background_tasks: BackgroundTasks):
+        """Retry a task using the browser-use agent as fallback"""
+        try:
+            # Get API key for LLM
+            api_key = os.getenv('OPENAI_API_KEY')
+            if not api_key:
+                raise HTTPException(status_code=400, detail='OPENAI_API_KEY environment variable not set')
+
+            # Create LLM
+            llm = ChatOpenAI(
+                model=request.model,
+                api_key=api_key,
+                temperature=0.7,
+            )
+
+            # Create browser profile with allowed domains
+            profile = BrowserProfile(
+                downloads_path=str(Path.home() / 'Downloads' / 'browser-use-api'),
+                wait_between_actions=0.5,
+                keep_alive=True,
+                user_data_dir='~/.config/browseruse/profiles/api-agent',
+                headless=True,
+                allowed_domains=request.allowed_domains,
+            )
+
+            # Create and run agent
+            agent = Agent(
+                task=request.task,
+                llm=llm,
+                browser_profile=profile,
+                use_vision=request.use_vision,
+            )
+
+            # Generate unique task ID
+            task_id = f"retry_task_{int(time.time() * 1000)}"
+            
+            # Store agent (will replace if session_id exists)
+            server_state.agents[task_id] = agent
+
+            # Run agent in background
+            async def run_retry_agent():
+                try:
+                    history = await agent.run(max_steps=request.max_steps)
+                    logger.info(f"Retry agent task {task_id} completed. Success: {history.is_successful()}")
+                except Exception as e:
+                    logger.error(f"Retry agent task {task_id} failed: {e}")
+                finally:
+                    # Clean up agent
+                    try:
+                        await agent.close()
+                    except Exception as e:
+                        logger.error(f"Error closing retry agent {task_id}: {e}")
+
+            background_tasks.add_task(run_retry_agent)
+
+            return {
+                "task_id": task_id,
+                "status": "started",
+                "message": f"Retry agent task {task_id} started with {request.max_steps} max steps",
+                "session_id": request.session_id
+            }
+
+        except Exception as e:
+            logger.error(f"Error running retry agent: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post("/browser/state", response_model=BrowserStateResponse)
