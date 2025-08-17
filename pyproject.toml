@@ -54,6 +54,10 @@ dependencies = [
 # textual: used for terminal UI
 
 [project.optional-dependencies]
+api = [
+    "fastapi>=0.115.8",
+    "uvicorn>=0.34.0",
+]
 cli = [
     "rich>=14.0.0",
     "click>=8.1.8",
@@ -80,7 +84,7 @@ eval = [
     "browserbase==1.4.0",
 ]
 all = [
-    "browser-use[cli,examples,aws]",
+    "browser-use[cli,examples,aws,api]",
 ]
 
 # will prefer to use local source code checked out in ../../browser-use (if present) instead of pypi browser-use package
@@ -94,6 +98,7 @@ Repository = "https://github.com/browser-use/browser-use"
 [project.scripts]
 browseruse = "browser_use.cli:main"
 browser-use = "browser_use.cli:main"
+browser-use-api = "browser_use.api.server:main"
 
 [build-system]
 requires = ["hatchling"]
